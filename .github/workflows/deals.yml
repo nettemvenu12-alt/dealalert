@@ -18,6 +18,8 @@ jobs:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install OCR for price history
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr >/dev/null && pip install -q pillow
       - uses: actions/cache/restore@v4
         with:
           path: state.json

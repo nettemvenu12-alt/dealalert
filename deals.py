@@ -14,6 +14,7 @@ Usage:
   deals.py --loop N   keep checking every 20 s for N minutes
   deals.py --test     print what would be sent from the current posts (sends nothing)
 """
+import history
 import datetime, html, json, os, re, sys, time, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -66,6 +67,29 @@ def discount(text):
         if m > 0 and lows:
             best = max(best, 100 * (1 - min(lows) / m))
     return best
+
+
+NOT_PRICE = re.compile(r"\b(coupon|code|cashback|save|off|cc|card|bank|emi|mrp|exchange|above|orders?|min)\b", re.I)
+DEAL_PRICE = re.compile(r"(?:@|offer price|deal price|price|now(?: just)?|at just|just|✅|💰|💵|only|at)\s*[:\-]?\s*"
+                        r"(?:₹|rs\.?|inr)?\s*([\d,]{2,9})(?:\.\d+)?(?!\s*%)", re.I)
+
+
+def deal_price(text):
+    """The selling price of the deal (not MRP, coupon or bank-offer amounts)."""
+    for m in DEAL_PRICE.finditer(text):
+        before = text[max(0, m.start() - 25):m.start()]
+        after = text[m.end():m.end() + 12]
+        if NOT_PRICE.search(before) or re.match(r"\s*(off|cashback|coupon|instant)", after, re.I):
+            continue
+        v = money(m.group(1))
+        if v >= 1:
+            return v
+    good = []
+    for m in re.finditer(r"(?:₹|rs\.?)\s*([\d,]+)", text, re.I):
+        ctx = text[max(0, m.start() - 25):m.end() + 12]
+        if not NOT_PRICE.search(ctx):
+            good.append(money(m.group(1)))
+    return min(good) if good else None
 
 
 def store_of(text):
@@ -171,6 +195,62 @@ def send(text, buttons=None):
     return tg("sendMessage", **p)
 
 
+def send_photo(url, caption, buttons=None):
+    """Photo (Keepa graph) with the alert as caption; long alerts go as a separate text."""
+    p = {"chat_id": cfg()["chat_id"], "photo": url}
+    if len(caption) <= 1000:
+        p["caption"] = caption
+        if buttons:
+            p["reply_markup"] = json.dumps({"inline_keyboard": buttons})
+        r = tg("sendPhoto", **p)
+        return r if r.get("ok") else send(caption, buttons)
+    tg("sendPhoto", **p)
+    return send(caption, buttons)
+
+
+def cached_history(state, asin, price):
+    """Keepa graph analysis, cached for 6 h per product (the label is recomputed for the new price)."""
+    cache = state.setdefault("hist", {})
+    c = cache.get(asin)
+    if not c or time.time() - c["t"] > 6 * 3600:
+        try:
+            h = history.analyse(history.fetch_graph(asin))
+        except Exception as e:
+            print("history failed:", asin, e)
+            h = None
+        c = {"t": time.time(), "h": h}
+        cache[asin] = c
+        for k in sorted(cache, key=lambda k: cache[k]["t"])[:-300]:
+            del cache[k]
+    if not c["h"]:
+        return None
+    return history.label(dict(c["h"]), price)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def dealsmagnet_store_link(page_url):
+    """DealsMagnet hides the store link behind its Buy button (/buy?<data-code> -> 307 to the store)."""
+    try:
+        page = http(page_url, timeout=12).decode("utf-8", "replace")
+        code = re.search(r'id="BuyNowButton"', page) and re.search(r'data-code="([^"]+)"[^>]*id="BuyNowButton"', page)
+        if not code:
+            return ""
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request("https://www.dealsmagnet.com/buy?" + html.unescape(code.group(1)),
+                                     headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14)"})
+        try:
+            opener.open(req, timeout=12)
+        except urllib.error.HTTPError as e:
+            return e.headers.get("Location", "")
+    except Exception as e:
+        print("dealsmagnet link failed:", e)
+    return ""
+
+
 def resolve(link):
     """Follow a short/affiliate link to the real store page. Returns (clean_url, store, asin)."""
     if not link:
@@ -182,6 +262,8 @@ def resolve(link):
         final = e.url or link
     except Exception:
         final = link
+    if "dealsmagnet.com/deal/" in final:
+        final = dealsmagnet_store_link(final) or final
     asin = re.search(r"amazon\.in/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10})", final)
     if asin:
         return f"https://www.amazon.in/dp/{asin.group(1)}", "Amazon", asin.group(1)
@@ -389,7 +471,10 @@ def check(state, settings, test=False):
             if not test and pid <= last:
                 continue
             why, urgent = classify(text, settings)
-            if not why:
+            amazonish = re.search(r"amzn|amazon", text, re.I)
+            maybe = amazonish and not OTHER_STORE.search(text) and not muted(text, settings) and (
+                discount(text) >= 40 or LOOT.search(text) or (ELECTRONICS.search(text) and discount(text) >= 25))
+            if not why and not maybe:
                 continue
             fp = fingerprint(text)
             if fp in seen:
@@ -400,13 +485,39 @@ def check(state, settings, test=False):
                 continue
             store = rstore or store_of(text)
             text = re.sub(r"\n{3,}", "\n\n", text)
-            msg = f"{why}{'  · ' + store if store else ''}\n\n{text}\n\n⏱ Fast ga open cheyyandi, ivi nimishallo ayipothayi."
+            price = deal_price(text)
+            hist, proof = None, ""
+            if asin and price and not test:
+                hist = cached_history(state, asin, price)
+            if hist:
+                watch = why and why.startswith("⭐")
+                saving = hist["median"] - price
+                real = hist["label"].startswith("🚨") or (hist["label"].startswith("✅") and (
+                    hist["drop"] >= 30 or saving >= 1500 or (ELECTRONICS.search(text) and hist["drop"] >= 20)))
+                if not real and not watch:
+                    print("skip fake:", asin, price, hist["label"])
+                    continue
+                why = (why + "  ·  " + hist["label"]) if watch else hist["label"]
+                urgent = urgent and watch or hist["label"].startswith("🚨")
+                proof = (f"\n📊 90 rojula history: low ₹{hist['low']:,.0f} · usual ₹{hist['median']:,.0f} · "
+                         f"high ₹{hist['high']:,.0f}\n💰 Ippudu ₹{price:,.0f}  ({hist['drop']:.0f}% usual kante takkuva)")
+            elif not why:
+                continue                       # Amazon candidate whose history we couldn't read
+            elif store == "Amazon" and asin:
+                why += "  ·  ⚠️ history check kaaledu"
+            elif store != "Amazon":
+                why += "  ·  ⚠️ history ledu (verify)"
+            msg = (f"{why}{'  · ' + store if store else ''}{proof}\n\n{text}\n\n"
+                   f"⏱ Fast ga open cheyyandi, ivi nimishallo ayipothayi.")
             print(msg[:200].replace("\n", " | "), "\n")
             if test:
                 continue
             remember(state, discount(text), why, text, link)
             if not settings["paused"]:
-                send(msg, buttons_for(link, asin, text))
+                if hist:
+                    send_photo(history.graph_url(asin), msg, buttons_for(link, asin, text))
+                else:
+                    send(msg, buttons_for(link, asin, text))
                 if urgent:
                     alarm(f"{why} {store}".strip(), title_of(text), link)
                 time.sleep(1)
