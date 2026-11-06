@@ -563,6 +563,10 @@ def main():
     if "--test" in sys.argv:
         check(state, settings, test=True)
         return
+    try:                                   # self-test: can we still read Keepa price graphs?
+        print("history self-test:", history.analyse(history.fetch_graph("B0CTZX85DY")), flush=True)
+    except Exception as e:
+        print("history self-test failed:", e, flush=True)
     minutes = int(sys.argv[sys.argv.index("--loop") + 1]) if "--loop" in sys.argv else 0
     end = time.time() + minutes * 60
     while True:

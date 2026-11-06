@@ -25,7 +25,7 @@ jobs:
           path: state.json
           key: deal-state-${{ github.run_id }}
           restore-keys: deal-state-
-      - run: python3 deals.py --loop 58
+      - run: python3 -u deals.py --loop 58
       - uses: actions/cache/save@v4
         if: always()
         with:
