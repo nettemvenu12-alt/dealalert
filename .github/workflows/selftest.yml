@@ -1,0 +1,9 @@
+name: selftest
+on: workflow_dispatch
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr >/dev/null && pip install -q pillow
+      - run: python3 -c "import history;print('SELFTEST', history.analyse(history.fetch_graph('B0CTZX85DY')))"
