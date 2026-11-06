@@ -1,7 +1,7 @@
 name: deal-alert
 on:
   schedule:
-    - cron: "*/30 * * * *"   # each run watches ~28 min, checking every 20 s
+    - cron: "*/30 * * * *"   # each run watches ~58 min; the next run waits in the queue, so no gaps
   workflow_dispatch:
 permissions:
   contents: write
@@ -11,7 +11,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 65
     env:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -25,7 +25,7 @@ jobs:
           path: state.json
           key: deal-state-${{ github.run_id }}
           restore-keys: deal-state-
-      - run: python3 deals.py --loop 28
+      - run: python3 deals.py --loop 58
       - uses: actions/cache/save@v4
         if: always()
         with:
@@ -38,3 +38,8 @@ jobs:
             git config user.name "dealalert-bot"; git config user.email "dealalert-bot@users.noreply.github.com"
             git add settings.json; git commit -m "Update settings"; git pull --rebase && git push
           fi
+      - name: Tell me if the bot broke
+        if: failure()
+        run: |
+          curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode text="⚠️ Deal Alert bot lo error vachindi. Next run lo automatic ga malli start avutundi. Log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >/dev/null

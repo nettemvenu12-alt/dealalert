@@ -423,6 +423,15 @@ def handle_commands(state, settings):
 
 # ---------- summary ----------
 
+def stat(state, key, n=1):
+    today = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+    st = state.setdefault("stats", {})
+    if st.get("date") != today:
+        st.clear()
+        st["date"] = today
+    st[key] = st.get(key, 0) + n
+
+
 def remember(state, d, why, text, link=""):
     today = datetime.datetime.now(IST).strftime("%Y-%m-%d")
     day = state.setdefault("today", {"date": today, "deals": []})
@@ -447,7 +456,10 @@ def send_summary(state, now=False):
         tag = "🚨" if "MISTAKE" in x["why"] else ("⭐" if "WATCH" in x["why"] else f"{x['d']}%")
         price = f" ₹{x['p']}" if x["p"] else ""
         lines.append(f"{i}. {tag}{price} {x['t']}{' · ' + x['store'] if x['store'] else ''}\n{x['link']}")
-    send(f"🏆 Today's top {len(lines)} deals ({day['date']})\n\n" + "\n\n".join(lines))
+    st = state.get("stats", {})
+    footer = (f"\n\n📈 Ivala: {st.get('posts', 0)} posts scan chesanu · {st.get('sent', 0)} alerts pampanu "
+              f"({st.get('verified', 0)} history tho verify) · {st.get('fake', 0)} fake discounts skip chesanu.")
+    send(f"🏆 Today's top {len(lines)} deals ({day['date']})\n\n" + "\n\n".join(lines) + footer)
 
 
 # ---------- main loop ----------
@@ -470,6 +482,8 @@ def check(state, settings, test=False):
         for pid, text in sorted(posts):
             if not test and pid <= last:
                 continue
+            if not test:
+                stat(state, "posts")
             why, urgent = classify(text, settings)
             amazonish = re.search(r"amzn|amazon", text, re.I)
             maybe = amazonish and not OTHER_STORE.search(text) and not muted(text, settings) and (
@@ -480,6 +494,14 @@ def check(state, settings, test=False):
             if fp in seen:
                 continue
             seen.append(fp)
+            # same product from another channel (titles differ): skip unless it's clearly cheaper
+            key = " ".join([w for w in re.findall(r"[a-z0-9]{2,}", title_of(text).lower()) if w not in FILLER][:2])
+            dp = deal_price(text) or 0
+            prev = state.setdefault("recent", {}).get(key)
+            if key and prev and dp and dp >= 0.95 * prev["p"] and time.time() - prev["t"] < 12 * 3600:
+                continue
+            if key and dp:
+                state["recent"][key] = {"p": dp, "t": time.time()}
             link, rstore, asin = resolve(first_link(text)) if not test else (first_link(text), "", "")
             if rstore == "OTHER":            # link really goes to Zepto/Ajio/etc.
                 continue
@@ -492,10 +514,13 @@ def check(state, settings, test=False):
             if hist:
                 watch = why and why.startswith("⭐")
                 saving = hist["median"] - price
-                real = hist["label"].startswith("🚨") or (hist["label"].startswith("✅") and (
-                    hist["drop"] >= 30 or saving >= 1500 or (ELECTRONICS.search(text) and hist["drop"] >= 20)))
+                elec = bool(ELECTRONICS.search(text))
+                worth = elec or saving >= 250              # skip ₹50-savings on cheap stuff
+                real = worth and (hist["label"].startswith("🚨") or (hist["label"].startswith("✅") and (
+                    hist["drop"] >= 30 or saving >= 1500 or (elec and hist["drop"] >= 20))))
                 if not real and not watch:
                     print("skip fake:", asin, price, hist["label"])
+                    stat(state, "fake")
                     continue
                 why = (why + "  ·  " + hist["label"]) if watch else hist["label"]
                 urgent = urgent and watch or hist["label"].startswith("🚨")
@@ -513,6 +538,9 @@ def check(state, settings, test=False):
             if test:
                 continue
             remember(state, discount(text), why, text, link)
+            stat(state, "sent")
+            if hist:
+                stat(state, "verified")
             if not settings["paused"]:
                 if hist:
                     send_photo(history.graph_url(asin), msg, buttons_for(link, asin, text))
@@ -524,6 +552,9 @@ def check(state, settings, test=False):
         if not test:
             state[ch] = max(newest, last or 0)
     del seen[:-600]
+    rec = state.get("recent", {})
+    for k in [k for k, v in rec.items() if time.time() - v["t"] > 12 * 3600]:
+        del rec[k]
 
 
 def main():
