@@ -2,16 +2,28 @@
 """Deal Alert: watch public Telegram deal channels and forward only price-mistake / huge-discount
 deals (Amazon, Flipkart, Myntra, mainly electronics) to the user's own Telegram bot.
 
+Features
+  - filters: price mistakes, very big discounts, electronics deals, user's watchlist
+  - de-duplicates the same deal posted by several channels
+  - bot commands: /add /remove /list /min /elec /pause /resume /top /help
+  - loud phone alarm (ntfy, urgent priority) for price mistakes and watchlist hits
+  - nightly top-10 summary at 21:00 IST
+
 Usage:
   deals.py            one check
   deals.py --loop N   keep checking every 20 s for N minutes
   deals.py --test     print what would be sent from the current posts (sends nothing)
 """
-import html, json, os, re, sys, time, urllib.parse, urllib.request
+import datetime, html, json, os, re, sys, time, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STATE = os.path.join(HERE, "state.json")
-CHANNELS = ["desidime", "dealsmagnet", "dealsheaven"]
+STATE = os.path.join(HERE, "state.json")          # runtime state (Actions cache)
+SETTINGS = os.path.join(HERE, "settings.json")    # user settings (committed to the repo)
+CHANNELS = ["desidime", "dealsmagnet", "dealsheaven", "idoffers", "coolztricks", "coolzdeals",
+            "GrabOnIndiaOfficial", "OfferLootApp", "ExtraPe", "pricehistoryapp", "desidime_deals"]
+DEFAULTS = {"watch": [], "min_off": 90, "elec_off": 70, "paused": False}
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+SUMMARY_HOUR = 21
 
 MISTAKE = re.compile(r"price\s*(error|mistake|glitch|bug)|\bglitch\b|pricing error|"
                      r"(?:at|@)\s*(?:₹|rs\.?)?\s*1(?![\d,.])", re.I)
@@ -24,13 +36,22 @@ ELECTRONICS = re.compile(r"phone|mobile|iphone|galaxy|redmi|poco|realme|oneplus|
                          r"power ?bank|keyboard|mouse|printer|projector|console|playstation|xbox|trimmer|"
                          r"refrigerator|fridge|washing machine|\bac\b|air conditioner|microwave|purifier|"
                          r"processor|graphics|gpu|\bram\b|electronics", re.I)
-STORE = re.compile(r"amazon|amzn|flipkart|fkrt|fktr|myntra|myntr", re.I)
 OTHER_STORE = re.compile(r"ajio|meesho|nykaa|tata ?cliq|croma|jiomart|shopsy|blinkit|zepto|instamart|swiggy|"
                          r"location specific", re.I)
+STORES = (("amzn|amazon", "Amazon"), ("fkrt|fktr|flipkart", "Flipkart"), ("myntr", "Myntra"))
+FILLER = set("off price error mistake loot deal deals now just mrp save buy read more link https http www com "
+             "amazon flipkart myntra open grab only the and with for get flat apply coupon bank offer store "
+             "posted limited time hurry checked available".split())
 
+
+# ---------- parsing ----------
 
 def money(s):
     return float(s.replace(",", ""))
+
+
+def prices(text):
+    return [money(p) for p in re.findall(r"(?:₹|rs\.?)\s*([\d,]+(?:\.\d+)?)", text, re.I) if p.strip(",")]
 
 
 def discount(text):
@@ -40,34 +61,75 @@ def discount(text):
         best = max(best, float(m.group(1)))
     mrp = re.search(r"mrp\s*[:\-]?\s*(?:₹|rs\.?)\s*([\d,]+)", text, re.I)
     if mrp:
-        prices = [money(p) for p in re.findall(r"(?:₹|rs\.?)\s*([\d,]+)", text, re.I)]
         m = money(mrp.group(1))
-        lows = [p for p in prices if 0 < p < m]
+        lows = [p for p in prices(text) if 0 < p < m]
         if m > 0 and lows:
             best = max(best, 100 * (1 - min(lows) / m))
     return best
 
 
-def worth_sending(text):
-    """Return a short reason if the post looks like a price mistake / huge deal, else None."""
-    if OTHER_STORE.search(text):
-        return None
-    if MISTAKE.search(text):
-        return "🚨 PRICE MISTAKE"
-    if SALE_BANNER.search(text):          # "up to 80% off" sale pages are not real steals
-        return None
-    d = discount(text)
-    elec = bool(ELECTRONICS.search(text))
-    if d >= 90 or (LOOT.search(text) and d >= 80):
-        return f"🔥 {d:.0f}% off"
-    if elec and d >= 70:
-        return f"⚡ Electronics {d:.0f}% off"
+def store_of(text):
+    return next((n for k, n in STORES if re.search(k, text, re.I)), "")
+
+
+def first_link(text):
+    m = re.search(r"https?://\S+", text)
+    return m.group(0).rstrip(").,") if m else ""
+
+
+def title_of(text):
+    for line in text.splitlines():
+        words = re.findall(r"[A-Za-z]{3,}", line)
+        if len([w for w in words if w.lower() not in FILLER]) >= 3:
+            return re.sub(r"^[^\w]+", "", line).strip()[:90]
+    return text.strip().splitlines()[0][:90] if text.strip() else ""
+
+
+def fingerprint(text):
+    words = [w for w in re.findall(r"[a-z]{3,}", text.lower()) if w not in FILLER][:4]
+    p = prices(text)
+    return " ".join(words) + "|" + (str(int(min(p))) if p else "")
+
+
+def watch_hit(text, settings):
+    low = text.lower()
+    for w in settings["watch"]:
+        if all(part in low for part in w["word"].lower().split()):
+            p = prices(text)
+            if w.get("max") and p and min(p) > w["max"]:
+                continue
+            return w["word"]
     return None
 
 
+def classify(text, settings):
+    """Return (reason, urgent) if the post should be sent, else (None, False)."""
+    if OTHER_STORE.search(text):
+        return None, False
+    hit = watch_hit(text, settings)
+    if hit:
+        return f"⭐ WATCHLIST: {hit}", True
+    if MISTAKE.search(text):
+        return "🚨 PRICE MISTAKE", True
+    if SALE_BANNER.search(text):          # "up to 80% off" sale pages are not real steals
+        return None, False
+    d = discount(text)
+    if d >= settings["min_off"] or (LOOT.search(text) and d >= min(80, settings["min_off"])):
+        return f"🔥 {d:.0f}% off", False
+    if ELECTRONICS.search(text) and d >= settings["elec_off"]:
+        return f"⚡ Electronics {d:.0f}% off", False
+    return None, False
+
+
+# ---------- I/O ----------
+
+def http(url, data=None, headers=None, timeout=25):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": "Mozilla/5.0 DealAlert", **(headers or {})})
+    return urllib.request.urlopen(req, timeout=timeout).read()
+
+
 def fetch(channel):
-    req = urllib.request.Request(f"https://t.me/s/{channel}", headers={"User-Agent": "Mozilla/5.0 DealAlert"})
-    page = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "replace")
+    page = http(f"https://t.me/s/{channel}").decode("utf-8", "replace")
     posts = []
     for block in page.split('data-post="')[1:]:
         pid = block.split('"', 1)[0]
@@ -82,22 +144,147 @@ def fetch(channel):
 
 def cfg():
     p = os.path.join(HERE, "telegram.json")
-    if os.path.exists(p):
-        return json.load(open(p))
-    return {"token": os.environ["TELEGRAM_TOKEN"], "chat_id": os.environ["TELEGRAM_CHAT_ID"]}
+    c = json.load(open(p)) if os.path.exists(p) else {}
+    return {"token": c.get("token") or os.environ["TELEGRAM_TOKEN"],
+            "chat_id": str(c.get("chat_id") or os.environ["TELEGRAM_CHAT_ID"]),
+            "ntfy": c.get("ntfy") or os.environ.get("NTFY_TOPIC", "")}
+
+
+def tg(method, **params):
+    c = cfg()
+    r = json.loads(http(f"https://api.telegram.org/bot{c['token']}/{method}",
+                        urllib.parse.urlencode(params).encode(), timeout=30))
+    if not r.get("ok"):
+        print("Telegram error:", r)
+    return r
 
 
 def send(text):
-    c = cfg()
-    data = urllib.parse.urlencode({"chat_id": c["chat_id"], "text": text[:3900],
-                                   "disable_web_page_preview": "false"}).encode()
-    r = json.loads(urllib.request.urlopen(f"https://api.telegram.org/bot{c['token']}/sendMessage",
-                                          data, timeout=20).read())
-    if not r.get("ok"):
-        print("Telegram error:", r)
+    return tg("sendMessage", chat_id=cfg()["chat_id"], text=text[:3900])
 
 
-def check(state, test=False):
+def alarm(title, text, link):
+    """Loud phone notification through ntfy (urgent priority rings even on silent-ish settings)."""
+    topic = cfg()["ntfy"]
+    if not topic:
+        return
+    try:
+        h = {"Title": title.encode("utf-8").decode("latin-1", "ignore") or "Deal", "Priority": "urgent",
+             "Tags": "rotating_light"}
+        if link:
+            h["Click"] = link
+        http(f"https://ntfy.sh/{topic}", text[:500].encode("utf-8"), h)
+    except Exception as e:
+        print("ntfy failed:", e)
+
+
+def load(path, default):
+    try:
+        return {**default, **json.load(open(path))}
+    except Exception:
+        return dict(default)
+
+
+def save(path, obj):
+    json.dump(obj, open(path, "w"), indent=1, ensure_ascii=False)
+
+
+# ---------- bot commands ----------
+
+HELP = ("Deal Alert commands:\n"
+        "/add iphone 15 – watch a product (any discount)\n"
+        "/add airpods 9000 – watch, only if price ≤ ₹9000\n"
+        "/remove iphone 15 – stop watching\n"
+        "/list – your watchlist and settings\n"
+        "/min 85 – send any deal with at least 85% off (now {min_off}%)\n"
+        "/elec 60 – electronics with at least 60% off (now {elec_off}%)\n"
+        "/pause, /resume – stop or restart alerts\n"
+        "/top – today's top 10 deals now")
+
+
+def handle_commands(state, settings):
+    """Read new messages to the bot and apply commands. Returns True if settings changed."""
+    try:
+        r = tg("getUpdates", offset=state.get("offset", 0), timeout=0)
+    except Exception as e:
+        print("getUpdates failed:", e)
+        return False
+    changed = False
+    me = cfg()["chat_id"]
+    for u in r.get("result", []):
+        state["offset"] = u["update_id"] + 1
+        msg = u.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != me:
+            continue
+        text = (msg.get("text") or "").strip()
+        cmd, _, arg = text.partition(" ")
+        cmd, arg = cmd.lower().split("@")[0], arg.strip()
+        if cmd == "/add" and arg:
+            m = re.match(r"(.*?)\s+(?:₹|rs\.?)?\s*(\d{3,7})$", arg, re.I)
+            word, mx = (m.group(1), int(m.group(2))) if m else (arg, None)
+            settings["watch"] = [w for w in settings["watch"] if w["word"].lower() != word.lower()]
+            settings["watch"].append({"word": word, "max": mx})
+            send(f"⭐ Watching \"{word}\"" + (f" up to ₹{mx}" if mx else "") + ". Loud alarm vastundi.")
+            changed = True
+        elif cmd == "/remove" and arg:
+            before = len(settings["watch"])
+            settings["watch"] = [w for w in settings["watch"] if w["word"].lower() != arg.lower()]
+            send("Removed." if len(settings["watch"]) < before else f"\"{arg}\" watchlist lo ledu. /list chudandi.")
+            changed = True
+        elif cmd == "/list":
+            wl = "\n".join(f"• {w['word']}" + (f" (≤ ₹{w['max']})" if w.get("max") else "")
+                           for w in settings["watch"]) or "• (empty) – /add iphone"
+            send(f"Watchlist:\n{wl}\n\nAny deal ≥ {settings['min_off']}% off\nElectronics ≥ {settings['elec_off']}% off\n"
+                 f"Price mistakes: always\nAlerts: {'PAUSED' if settings['paused'] else 'ON'}")
+        elif cmd in ("/min", "/elec") and arg.rstrip("%").isdigit():
+            key = "min_off" if cmd == "/min" else "elec_off"
+            settings[key] = max(30, min(99, int(arg.rstrip("%"))))
+            send(f"OK, {'any deal' if cmd == '/min' else 'electronics'} ≥ {settings[key]}% off.")
+            changed = True
+        elif cmd in ("/pause", "/resume"):
+            settings["paused"] = cmd == "/pause"
+            send("⏸ Alerts paused. /resume to restart." if settings["paused"] else "▶️ Alerts ON.")
+            changed = True
+        elif cmd == "/top":
+            send_summary(state, now=True)
+        elif cmd in ("/help", "/start"):
+            send(HELP.format(**settings))
+    return changed
+
+
+# ---------- summary ----------
+
+def remember(state, d, why, text):
+    today = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+    day = state.setdefault("today", {"date": today, "deals": []})
+    if day["date"] != today:
+        state["today"] = day = {"date": today, "deals": []}
+    score = d + (100 if "MISTAKE" in why else 0)
+    day["deals"].append({"s": score, "d": round(d), "why": why, "t": title_of(text),
+                         "p": int(min(prices(text))) if prices(text) else None,
+                         "store": store_of(text), "link": first_link(text)})
+    day["deals"] = sorted(day["deals"], key=lambda x: -x["s"])[:30]
+
+
+def send_summary(state, now=False):
+    day = state.get("today") or {}
+    deals = day.get("deals") or []
+    if not deals:
+        if now:
+            send("Ivala inka pedda deals raaledu.")
+        return
+    lines = []
+    for i, x in enumerate(deals[:10], 1):
+        tag = "🚨" if "MISTAKE" in x["why"] else ("⭐" if "WATCH" in x["why"] else f"{x['d']}%")
+        price = f" ₹{x['p']}" if x["p"] else ""
+        lines.append(f"{i}. {tag}{price} {x['t']}{' · ' + x['store'] if x['store'] else ''}\n{x['link']}")
+    send(f"🏆 Today's top {len(lines)} deals ({day['date']})\n\n" + "\n\n".join(lines))
+
+
+# ---------- main loop ----------
+
+def check(state, settings, test=False):
+    seen = state.setdefault("seen", [])
     for ch in CHANNELS:
         try:
             posts = fetch(ch)
@@ -114,29 +301,48 @@ def check(state, test=False):
         for pid, text in sorted(posts):
             if not test and pid <= last:
                 continue
-            why = worth_sending(text)
-            if why:
-                store = next((n for k, n in (("amzn|amazon", "Amazon"), ("fkrt|fktr|flipkart", "Flipkart"),
-                                             ("myntr", "Myntra")) if re.search(k, text, re.I)), "")
-                msg = f"{why}{'  · ' + store if store else ''}\n\n{text}\n\n⏱ Fast ga open cheyyandi, ivi nimishallo ayipothayi."
-                print(msg[:300].replace("\n", " | "), "\n")
-                if not test:
-                    send(msg)
-                    time.sleep(1)
+            why, urgent = classify(text, settings)
+            if not why:
+                continue
+            fp = fingerprint(text)
+            if fp in seen:
+                continue
+            seen.append(fp)
+            store = store_of(text)
+            msg = f"{why}{'  · ' + store if store else ''}\n\n{text}\n\n⏱ Fast ga open cheyyandi, ivi nimishallo ayipothayi."
+            print(msg[:200].replace("\n", " | "), "\n")
+            if test:
+                continue
+            remember(state, discount(text), why, text)
+            if not settings["paused"]:
+                send(msg)
+                if urgent:
+                    alarm(f"{why} {store}".strip(), title_of(text), first_link(text))
+                time.sleep(1)
         if not test:
             state[ch] = max(newest, last or 0)
+    del seen[:-600]
 
 
 def main():
-    state = json.load(open(STATE)) if os.path.exists(STATE) else {}
+    state = load(STATE, {})
+    settings = load(SETTINGS, DEFAULTS)
     if "--test" in sys.argv:
-        check(state, test=True)
+        check(state, settings, test=True)
         return
     minutes = int(sys.argv[sys.argv.index("--loop") + 1]) if "--loop" in sys.argv else 0
     end = time.time() + minutes * 60
     while True:
-        check(state)
-        json.dump(state, open(STATE, "w"))
+        if handle_commands(state, settings):
+            save(SETTINGS, settings)
+        check(state, settings)
+        now = datetime.datetime.now(IST)
+        today = now.strftime("%Y-%m-%d")
+        if now.hour >= SUMMARY_HOUR and state.get("summary_sent") != today:
+            state["summary_sent"] = today
+            if not settings["paused"]:
+                send_summary(state)
+        save(STATE, state)
         if time.time() + 20 > end:
             break
         time.sleep(20)

@@ -3,6 +3,8 @@ on:
   schedule:
     - cron: "*/30 * * * *"   # each run watches ~28 min, checking every 20 s
   workflow_dispatch:
+permissions:
+  contents: write
 concurrency:
   group: deal-alert
   cancel-in-progress: false
@@ -13,6 +15,7 @@ jobs:
     env:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -26,3 +29,10 @@ jobs:
         with:
           path: state.json
           key: deal-state-${{ github.run_id }}
+      - name: Save watchlist / settings
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain settings.json)" ]; then
+            git config user.name "dealalert-bot"; git config user.email "dealalert-bot@users.noreply.github.com"
+            git add settings.json; git commit -m "Update settings"; git pull --rebase && git push
+          fi
