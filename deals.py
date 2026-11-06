@@ -21,7 +21,7 @@ STATE = os.path.join(HERE, "state.json")          # runtime state (Actions cache
 SETTINGS = os.path.join(HERE, "settings.json")    # user settings (committed to the repo)
 CHANNELS = ["desidime", "dealsmagnet", "dealsheaven", "idoffers", "coolztricks", "coolzdeals",
             "GrabOnIndiaOfficial", "OfferLootApp", "ExtraPe", "pricehistoryapp", "desidime_deals"]
-DEFAULTS = {"watch": [], "min_off": 90, "elec_off": 70, "paused": False}
+DEFAULTS = {"watch": [], "mute": [], "min_off": 90, "elec_off": 70, "paused": False}
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 SUMMARY_HOUR = 21
 
@@ -102,9 +102,14 @@ def watch_hit(text, settings):
     return None
 
 
+def muted(text, settings):
+    low = text.lower()
+    return any(m.lower() in low for m in settings.get("mute", []))
+
+
 def classify(text, settings):
     """Return (reason, urgent) if the post should be sent, else (None, False)."""
-    if OTHER_STORE.search(text):
+    if OTHER_STORE.search(text) or muted(text, settings):
         return None, False
     hit = watch_hit(text, settings)
     if hit:
@@ -159,8 +164,58 @@ def tg(method, **params):
     return r
 
 
-def send(text):
-    return tg("sendMessage", chat_id=cfg()["chat_id"], text=text[:3900])
+def send(text, buttons=None):
+    p = {"chat_id": cfg()["chat_id"], "text": text[:3900]}
+    if buttons:
+        p["reply_markup"] = json.dumps({"inline_keyboard": buttons})
+    return tg("sendMessage", **p)
+
+
+def resolve(link):
+    """Follow a short/affiliate link to the real store page. Returns (clean_url, store, asin)."""
+    if not link:
+        return "", "", ""
+    try:
+        req = urllib.request.Request(link, headers={"User-Agent": "Mozilla/5.0"})
+        final = urllib.request.urlopen(req, timeout=8).geturl()
+    except urllib.error.HTTPError as e:
+        final = e.url or link
+    except Exception:
+        final = link
+    asin = re.search(r"amazon\.in/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10})", final)
+    if asin:
+        return f"https://www.amazon.in/dp/{asin.group(1)}", "Amazon", asin.group(1)
+    fk = re.search(r"(https://www\.flipkart\.com/[^?]+)(?:\?.*?(pid=[A-Z0-9]+))?", final)
+    if fk:
+        return fk.group(1) + ("?" + fk.group(2) if fk.group(2) else ""), "Flipkart", ""
+    my = re.search(r"https://www\.myntra\.com/[^?]+", final)
+    if my:
+        return my.group(0), "Myntra", ""
+    host = urllib.parse.urlparse(final).netloc.lower()
+    if OTHER_STORE.search(host):
+        return final, "OTHER", ""
+    return link, "", ""
+
+
+def mute_word(text):
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", title_of(text)):
+        if w.lower() not in FILLER:
+            return w
+    return ""
+
+
+def buttons_for(link, asin, text):
+    row = []
+    if link:
+        row.append({"text": "🛒 Buy now", "url": link})
+    if asin:
+        row.append({"text": "📈 Price history", "url": f"https://keepa.com/#!product/10-{asin}"})
+    rows = [row] if row else []
+    mw = mute_word(text)
+    if mw:
+        rows.append([{"text": f"🔕 Mute \"{mw}\"", "callback_data": f"m:{mw}"[:60]},
+                     {"text": "⭐ Watch", "callback_data": f"w:{mw}"[:60]}])
+    return rows
 
 
 def alarm(title, text, link):
@@ -198,6 +253,8 @@ HELP = ("Deal Alert commands:\n"
         "/list – your watchlist and settings\n"
         "/min 85 – send any deal with at least 85% off (now {min_off}%)\n"
         "/elec 60 – electronics with at least 60% off (now {elec_off}%)\n"
+        "/mute saree – hide deals with a word (or tap 🔕 under a deal)\n"
+        "/unmute saree – show them again\n"
         "/pause, /resume – stop or restart alerts\n"
         "/top – today's top 10 deals now")
 
@@ -213,6 +270,27 @@ def handle_commands(state, settings):
     me = cfg()["chat_id"]
     for u in r.get("result", []):
         state["offset"] = u["update_id"] + 1
+        cb = u.get("callback_query")
+        if cb and str(cb.get("from", {}).get("id")) == me:
+            kind, _, word = (cb.get("data") or "").partition(":")
+            if kind == "m" and word:
+                if word.lower() not in [m.lower() for m in settings["mute"]]:
+                    settings["mute"].append(word)
+                note = f"🔕 \"{word}\" deals ika raavu. /unmute {word} tho malli on."
+            elif kind == "w" and word:
+                settings["watch"] = [w for w in settings["watch"] if w["word"].lower() != word.lower()]
+                settings["watch"].append({"word": word, "max": None})
+                note = f"⭐ Watching \"{word}\"."
+            else:
+                note = ""
+            try:
+                tg("answerCallbackQuery", callback_query_id=cb["id"], text=note[:190])
+            except Exception:
+                pass
+            if note:
+                send(note)
+                changed = True
+            continue
         msg = u.get("message") or {}
         if str(msg.get("chat", {}).get("id")) != me:
             continue
@@ -231,11 +309,20 @@ def handle_commands(state, settings):
             settings["watch"] = [w for w in settings["watch"] if w["word"].lower() != arg.lower()]
             send("Removed." if len(settings["watch"]) < before else f"\"{arg}\" watchlist lo ledu. /list chudandi.")
             changed = True
+        elif cmd == "/mute" and arg:
+            if arg.lower() not in [m.lower() for m in settings["mute"]]:
+                settings["mute"].append(arg)
+            send(f"🔕 \"{arg}\" unna deals ika raavu.")
+            changed = True
+        elif cmd == "/unmute" and arg:
+            settings["mute"] = [m for m in settings["mute"] if m.lower() != arg.lower()]
+            send(f"🔔 \"{arg}\" malli on.")
+            changed = True
         elif cmd == "/list":
             wl = "\n".join(f"• {w['word']}" + (f" (≤ ₹{w['max']})" if w.get("max") else "")
                            for w in settings["watch"]) or "• (empty) – /add iphone"
             send(f"Watchlist:\n{wl}\n\nAny deal ≥ {settings['min_off']}% off\nElectronics ≥ {settings['elec_off']}% off\n"
-                 f"Price mistakes: always\nAlerts: {'PAUSED' if settings['paused'] else 'ON'}")
+                 f"Muted: {', '.join(settings['mute']) or '-'}\nPrice mistakes: always\nAlerts: {'PAUSED' if settings['paused'] else 'ON'}")
         elif cmd in ("/min", "/elec") and arg.rstrip("%").isdigit():
             key = "min_off" if cmd == "/min" else "elec_off"
             settings[key] = max(30, min(99, int(arg.rstrip("%"))))
@@ -254,7 +341,7 @@ def handle_commands(state, settings):
 
 # ---------- summary ----------
 
-def remember(state, d, why, text):
+def remember(state, d, why, text, link=""):
     today = datetime.datetime.now(IST).strftime("%Y-%m-%d")
     day = state.setdefault("today", {"date": today, "deals": []})
     if day["date"] != today:
@@ -262,7 +349,7 @@ def remember(state, d, why, text):
     score = d + (100 if "MISTAKE" in why else 0)
     day["deals"].append({"s": score, "d": round(d), "why": why, "t": title_of(text),
                          "p": int(min(prices(text))) if prices(text) else None,
-                         "store": store_of(text), "link": first_link(text)})
+                         "store": store_of(text), "link": link or first_link(text)})
     day["deals"] = sorted(day["deals"], key=lambda x: -x["s"])[:30]
 
 
@@ -308,16 +395,20 @@ def check(state, settings, test=False):
             if fp in seen:
                 continue
             seen.append(fp)
-            store = store_of(text)
+            link, rstore, asin = resolve(first_link(text)) if not test else (first_link(text), "", "")
+            if rstore == "OTHER":            # link really goes to Zepto/Ajio/etc.
+                continue
+            store = rstore or store_of(text)
+            text = re.sub(r"\n{3,}", "\n\n", text)
             msg = f"{why}{'  · ' + store if store else ''}\n\n{text}\n\n⏱ Fast ga open cheyyandi, ivi nimishallo ayipothayi."
             print(msg[:200].replace("\n", " | "), "\n")
             if test:
                 continue
-            remember(state, discount(text), why, text)
+            remember(state, discount(text), why, text, link)
             if not settings["paused"]:
-                send(msg)
+                send(msg, buttons_for(link, asin, text))
                 if urgent:
-                    alarm(f"{why} {store}".strip(), title_of(text), first_link(text))
+                    alarm(f"{why} {store}".strip(), title_of(text), link)
                 time.sleep(1)
         if not test:
             state[ch] = max(newest, last or 0)
