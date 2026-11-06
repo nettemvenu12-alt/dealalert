@@ -1,0 +1,28 @@
+name: deal-alert
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # each run watches ~28 min, checking every 20 s
+  workflow_dispatch:
+concurrency:
+  group: deal-alert
+  cancel-in-progress: false
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: deal-state-${{ github.run_id }}
+          restore-keys: deal-state-
+      - run: python3 deals.py --loop 28
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: deal-state-${{ github.run_id }}
