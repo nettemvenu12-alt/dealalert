@@ -11,7 +11,7 @@ Features
 
 Usage:
   deals.py            one check
-  deals.py --loop N   keep checking every 20 s for N minutes
+  deals.py --loop N   keep checking every ~10 s for N minutes
   deals.py --test     print what would be sent from the current posts (sends nothing)
 """
 import history, tracker
@@ -32,7 +32,7 @@ LOOT = re.compile(r"\bloot\b", re.I)
 SALE_BANNER = re.compile(r"\bup\s*to\b|\bupto\b|starts? at|starting", re.I)
 ELECTRONICS = re.compile(r"phone|mobile|iphone|galaxy|redmi|poco|realme|oneplus|vivo|oppo|iqoo|pixel|motorola|"
                          r"laptop|macbook|ipad|tablet|monitor|\btv\b|television|qled|oled|led tv|earbud|earphone|"
-                         r"headphone|neckband|tws|airpods|speaker|soundbar|smart ?watch|smartwatch|camera|gopro|"
+                         r"headphone|neckband|tws|airpods|airdopes|\bbuds\b|earpods|speaker|soundbar|smart ?watch|smartwatch|camera|gopro|"
                          r"\bssd\b|hard (disk|drive)|pendrive|pen drive|memory card|router|wifi|mesh|charger|"
                          r"power ?bank|keyboard|mouse|printer|projector|console|playstation|xbox|trimmer|"
                          r"refrigerator|fridge|washing machine|\bac\b|air conditioner|microwave|purifier|"
@@ -228,8 +228,10 @@ def tg(method, **params):
     return r
 
 
-def send(text, buttons=None):
+def send(text, buttons=None, reply_to=None):
     p = {"chat_id": cfg()["chat_id"], "text": text[:3900]}
+    if reply_to:
+        p["reply_to_message_id"] = reply_to
     if buttons:
         p["reply_markup"] = json.dumps({"inline_keyboard": buttons})
     return tg("sendMessage", **p)
@@ -683,12 +685,25 @@ def score_deal(text, price, hist, cat, final_line):
     return max(0, min(94, sc)), f"🔥 {d:.0f}% off (history ledu)" if d else "🔥 Deal (history ledu)"
 
 
+def _priority(text, settings):
+    if MISTAKE.search(text) or watch_hit(text, settings):
+        return 0
+    if LOOT.search(text) or discount(text) >= 70:
+        return 1
+    return 2
+
+
 def check(state, settings, test=False):
+    """Read all channels at once, then handle new posts – price mistakes and watchlist hits first."""
+    from concurrent.futures import ThreadPoolExecutor
     seen = state.setdefault("seen", [])
     need = LEVELS.get(settings.get("level", "normal"), 55)
-    for ch in CHANNELS:
+    with ThreadPoolExecutor(len(CHANNELS)) as ex:
+        futs = {ch: ex.submit(fetch, ch) for ch in CHANNELS}
+    queue = []
+    for ch, f in futs.items():
         try:
-            posts = fetch(ch)
+            posts = f.result()
         except Exception as e:
             print(ch, "fetch failed:", e)
             continue
@@ -700,95 +715,113 @@ def check(state, settings, test=False):
             state[ch] = newest
             continue
         for pid, text in sorted(posts):
-            if not test and pid <= last:
-                continue
-            if not test:
-                stat(state, "posts")
-            if OTHER_STORE.search(text) or muted(text, settings):
-                continue
-            if SALE_BANNER.search(text) and not deal_price(text) and not MISTAKE.search(text):
-                continue                       # "sale starts at / up to 80% off" banners
-            watch = watch_hit(text, settings)
-            fp = fingerprint(text)
-            if fp in seen:
-                continue
-            seen.append(fp)
-            # same product from another channel (titles differ): skip unless it's clearly cheaper
-            key = " ".join([w for w in re.findall(r"[a-z0-9]{2,}", title_of(text).lower()) if w not in FILLER][:2])
-            dp = deal_price(text) or 0
-            prev = state.setdefault("recent", {}).get(key)
-            if key and prev and dp and dp >= 0.95 * prev["p"] and time.time() - prev["t"] < 12 * 3600:
-                continue
-            if key and dp:
-                state["recent"][key] = {"p": dp, "t": time.time()}
-            link, rstore, asin = best_link(text) if not test else (first_link(text), "", "")
-            if rstore == "OTHER":            # link really goes to Zepto/Ajio/Blinkit etc.
-                continue
-            store = rstore or store_of(text)
-            text = re.sub(r"\n{3,}", "\n\n", text)
-            price = deal_price(text)
-            hist, proof = None, ""
-            if store in ("Amazon", "Flipkart") and link and not test:
-                live = None
-                try:
-                    _, live, oos = tracker.read({"store": store, "url": link})
-                    if oos:
-                        stat(state, "expired")
-                        continue
-                except Exception as e:
-                    print("live check failed:", e)
-                if live and price and live > price * 1.15:
-                    print("skip expired:", link, price, live)
-                    stat(state, "expired")
-                    continue
-                if live and (not price or live < price):
-                    price = live
-                if live:
-                    proof += f"\n🟢 Live ippudu: ₹{live:,.0f} ({store} lo direct check chesanu)"
-            if asin and price and not test:
-                hist = cached_history(state, asin, price)
-            elif store == "Flipkart" and price and link and not test:
-                import extras
-                hist = extras.fk_history(link, price)
-                extras.fk_record(link, price, title_of(text))
-            cat = category(text)
-            fline = final_price_line(text, price, settings.get("banks", []))
-            sc, label = score_deal(text, price, hist, cat, fline)
-            if watch:
-                label = f"⭐ WATCHLIST: {watch}  ·  {label}"
-            drop_ok = (hist and hist["drop"] >= settings.get("min_drop", 30) and hist["median"] - price >= 150) or \
-                      (not hist and discount(text) >= settings.get("min_drop", 30) + 20 and not label.startswith("❌"))
-            if sc < need and not watch and not drop_ok:
-                if hist:
-                    stat(state, "fake")
-                print(f"skip score {sc:.0f}: {title_of(text)[:50]}")
-                continue
-            urgent = sc >= 95 or bool(watch)
-            if hist:
-                src = "90 rojula" if asin else f"{hist.get('points', 0)} rojula (mana sontha Flipkart)"
-                proof += (f"\n📊 {src} history: low ₹{hist['low']:,.0f} · usual ₹{hist['median']:,.0f} · "
-                          f"high ₹{hist['high']:,.0f}\n💰 Ippudu ₹{price:,.0f}  ({hist['drop']:.0f}% usual kante takkuva)")
-            proof += fline
-            stars = "🟩" * round(sc / 20) + "⬜" * (5 - round(sc / 20))
-            msg = (f"{label}  · {store or '?'}\n{cat}  ·  Deal score {sc:.0f}/100 {stars}{proof}\n\n{text}\n\n"
-                   f"⏱ Fast ga open cheyyandi, ivi nimishallo ayipothayi.")
-            print(msg[:220].replace("\n", " | "), "\n")
-            if test:
-                continue
-            remember(state, sc, label, text, link)
-            stat(state, "sent")
-            if hist:
-                stat(state, "verified")
-            if not settings["paused"]:
-                if hist and asin:
-                    send_photo(history.graph_url(asin), msg, buttons_for(link, asin, text))
-                else:
-                    send(msg, buttons_for(link, asin, text))
-                if urgent:
-                    alarm(f"{label} {store}".strip()[:80], title_of(text), link)
-                time.sleep(1)
+            if test or pid > last:
+                queue.append((_priority(text, settings), ch, pid, text))
         if not test:
             state[ch] = max(newest, last or 0)
+    queue.sort(key=lambda q: q[0])
+    for prio, ch, pid, text in queue:
+        if not test:
+            stat(state, "posts")
+        if OTHER_STORE.search(text) or muted(text, settings):
+            continue
+        if SALE_BANNER.search(text) and not deal_price(text) and not MISTAKE.search(text):
+            continue                       # "sale starts at / up to 80% off" banners
+        watch = watch_hit(text, settings)
+        fp = fingerprint(text)
+        if fp in seen:
+            continue
+        seen.append(fp)
+        # same product from another channel (titles differ): skip unless it's clearly cheaper
+        key = " ".join([w for w in re.findall(r"[a-z0-9]{2,}", title_of(text).lower()) if w not in FILLER][:2])
+        dp = deal_price(text) or 0
+        prev = state.setdefault("recent", {}).get(key)
+        if key and prev and dp and dp >= 0.95 * prev["p"] and time.time() - prev["t"] < 12 * 3600:
+            continue
+        if key and dp:
+            state["recent"][key] = {"p": dp, "t": time.time()}
+        link, rstore, asin = best_link(text) if not test else (first_link(text), "", "")
+        if rstore == "OTHER":            # link really goes to Zepto/Ajio/Blinkit etc.
+            continue
+        store = rstore or store_of(text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        price = deal_price(text)
+        hist, proof = None, ""
+        fast_mid = None
+        if MISTAKE.search(text) and not test and not settings["paused"]:
+            # price mistakes vanish in minutes: send right away, verify after and reply with the result
+            r = send(f"🚨⚡ PRICE MISTAKE – FAST ALERT · {store or '?'}\n"
+                     f"(ippude post ayyindi – live check chesi 10 sec lo confirm chestanu)\n\n{text}",
+                     buttons_for(link, asin, text))
+            fast_mid = (r.get("result") or {}).get("message_id")
+            alarm(f"PRICE MISTAKE {store}".strip(), title_of(text), link)
+        if store in ("Amazon", "Flipkart") and link and not test:
+            live = None
+            try:
+                _, live, oos = tracker.read({"store": store, "url": link})
+                if oos:
+                    stat(state, "expired")
+                    if fast_mid:
+                        send("❌ Out of stock ayipoyindi.", reply_to=fast_mid)
+                    continue
+            except Exception as e:
+                print("live check failed:", e)
+            if live and price and live > price * 1.15:
+                print("skip expired:", link, price, live)
+                stat(state, "expired")
+                if fast_mid:
+                    send(f"❌ Ayipoyindi – ippudu live price ₹{live:,.0f}.", reply_to=fast_mid)
+                continue
+            if live and (not price or live < price):
+                price = live
+            if live:
+                proof += f"\n🟢 Live ippudu: ₹{live:,.0f} ({store} lo direct check chesanu)"
+        if asin and price and not test:
+            hist = cached_history(state, asin, price)
+        elif store == "Flipkart" and price and link and not test:
+            import extras
+            hist = extras.fk_history(link, price)
+            extras.fk_record(link, price, title_of(text))
+        cat = category(text)
+        fline = final_price_line(text, price, settings.get("banks", []))
+        sc, label = score_deal(text, price, hist, cat, fline)
+        if watch:
+            label = f"⭐ WATCHLIST: {watch}  ·  {label}"
+        drop_ok = (hist and hist["drop"] >= settings.get("min_drop", 30) and hist["median"] - price >= 150) or \
+                  (not hist and discount(text) >= settings.get("min_drop", 30) + 20 and not label.startswith("❌"))
+        if sc < need and not watch and not drop_ok:
+            if hist:
+                stat(state, "fake")
+            print(f"skip score {sc:.0f}: {title_of(text)[:50]}")
+            if fast_mid:
+                send(f"⚠️ Check chesanu: {label} (score {sc:.0f}/100) – nijam mistake laa ledu.", reply_to=fast_mid)
+            continue
+        urgent = sc >= 95 or bool(watch)
+        if hist:
+            src = "90 rojula" if asin else f"{hist.get('points', 0)} rojula (mana sontha Flipkart)"
+            proof += (f"\n📊 {src} history: low ₹{hist['low']:,.0f} · usual ₹{hist['median']:,.0f} · "
+                      f"high ₹{hist['high']:,.0f}\n💰 Ippudu ₹{price:,.0f}  ({hist['drop']:.0f}% usual kante takkuva)")
+        proof += fline
+        stars = "🟩" * round(sc / 20) + "⬜" * (5 - round(sc / 20))
+        msg = (f"{label}  · {store or '?'}\n{cat}  ·  Deal score {sc:.0f}/100 {stars}{proof}\n\n{text}\n\n"
+               f"⏱ Fast ga open cheyyandi, ivi nimishallo ayipothayi.")
+        print(msg[:220].replace("\n", " | "), "\n")
+        if test:
+            continue
+        remember(state, sc, label, text, link)
+        stat(state, "sent")
+        if hist:
+            stat(state, "verified")
+        if fast_mid:
+            send(f"✅ VERIFIED: {label} · score {sc:.0f}/100{proof}", buttons_for(link, asin, text), reply_to=fast_mid)
+        elif not settings["paused"]:
+            if hist and asin:
+                send_photo(history.graph_url(asin), msg, buttons_for(link, asin, text))
+            else:
+                send(msg, buttons_for(link, asin, text))
+            if urgent:
+                alarm(f"{label} {store}".strip()[:80], title_of(text), link)
+            time.sleep(1)
     del seen[:-600]
     rec = state.get("recent", {})
     for k in [k for k, v in rec.items() if time.time() - v["t"] > 12 * 3600]:
@@ -843,9 +876,9 @@ def main():
             if not settings["paused"]:
                 send_summary(state)
         save(STATE, state)
-        if time.time() + 20 > end:
+        if time.time() + 8 > end:
             break
-        time.sleep(20)
+        time.sleep(8)
 
 
 if __name__ == "__main__":
