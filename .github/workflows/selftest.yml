@@ -1,0 +1,14 @@
+name: selftest
+on: workflow_dispatch
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          UA="Mozilla/5.0 (Linux; Android 14; 2311DRK48I) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36"
+          for u in "https://www.amazon.in/dp/B0CTZX85DY" "https://www.flipkart.com/flipkart/p/itm1ce220861eacd?pid=FANHZ6KKRBGWWGZY" "https://www.myntra.com/tshirts/roadster/roadster-men-black-cotton-pure-cotton-t-shirt/1700944/buy" "https://www.ajio.com/p/469581503_black"; do
+            for i in 1 2 3; do
+              curl -s -m 20 -A "$UA" -H "Accept-Language: en-IN,en;q=0.9" -o p.html -w "RESULT $u %{http_code} %{size_download} " "$u"
+              grep -oE 'a-offscreen">[^<]{2,15}|Type the characters|"sellingPrice":\{?"?[a-z]*"?:?[0-9]+|"price":[0-9]+|"discountedPrice":[0-9]+|Access Denied|captcha|_3I9_wc|Nxk' p.html | head -3 | tr '\n' ' '; echo; sleep 3
+            done
+          done
