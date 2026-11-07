@@ -22,14 +22,18 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr >/dev/null && pip install -q pillow
       - uses: actions/cache/restore@v4
         with:
-          path: state.json
+          path: |
+            state.json
+            fk_history.json
           key: deal-state-${{ github.run_id }}
           restore-keys: deal-state-
       - run: python3 -u deals.py --loop 58
       - uses: actions/cache/save@v4
         if: always()
         with:
-          path: state.json
+          path: |
+            state.json
+            fk_history.json
           key: deal-state-${{ github.run_id }}
       - name: Save watchlist / settings
         if: always()

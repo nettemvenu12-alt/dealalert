@@ -747,6 +747,10 @@ def check(state, settings, test=False):
                     proof += f"\n🟢 Live ippudu: ₹{live:,.0f} ({store} lo direct check chesanu)"
             if asin and price and not test:
                 hist = cached_history(state, asin, price)
+            elif store == "Flipkart" and price and link and not test:
+                import extras
+                hist = extras.fk_history(link, price)
+                extras.fk_record(link, price, title_of(text))
             cat = category(text)
             fline = final_price_line(text, price, settings.get("banks", []))
             sc, label = score_deal(text, price, hist, cat, fline)
@@ -761,7 +765,8 @@ def check(state, settings, test=False):
                 continue
             urgent = sc >= 95 or bool(watch)
             if hist:
-                proof += (f"\n📊 90 rojula history: low ₹{hist['low']:,.0f} · usual ₹{hist['median']:,.0f} · "
+                src = "90 rojula" if asin else f"{hist.get('points', 0)} rojula (mana sontha Flipkart)"
+                proof += (f"\n📊 {src} history: low ₹{hist['low']:,.0f} · usual ₹{hist['median']:,.0f} · "
                           f"high ₹{hist['high']:,.0f}\n💰 Ippudu ₹{price:,.0f}  ({hist['drop']:.0f}% usual kante takkuva)")
             proof += fline
             stars = "🟩" * round(sc / 20) + "⬜" * (5 - round(sc / 20))
@@ -775,7 +780,7 @@ def check(state, settings, test=False):
             if hist:
                 stat(state, "verified")
             if not settings["paused"]:
-                if hist:
+                if hist and asin:
                     send_photo(history.graph_url(asin), msg, buttons_for(link, asin, text))
                 else:
                     send(msg, buttons_for(link, asin, text))
@@ -819,6 +824,16 @@ def main():
         if handle_commands(state, settings):
             save(SETTINGS, settings)
         check(state, settings)
+        import extras
+        for fn in (lambda: extras.amazon_scan(state, settings), lambda: extras.fk_daily_refresh(state),
+                   lambda: extras.weekly_advice(state, settings)):
+            try:
+                fn()
+            except Exception as e:
+                print("extra failed:", e, flush=True)
+        for it in settings.get("track", []):
+            if it["store"] == "Flipkart" and it.get("last"):
+                extras.fk_record(it["url"], it["last"], it.get("title", ""))
         if settings.get("track") and tracker.check(settings, lambda t, it, urgent: track_alert(t, it, urgent, settings)):
             save(SETTINGS, settings)
         now = datetime.datetime.now(IST)

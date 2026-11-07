@@ -23,9 +23,46 @@ def fetch_graph(asin, days=90):
     return urllib.request.urlopen(req, timeout=20).read()
 
 
+def _erase_rupee(crop):
+    """Whiten the '₹' sign in front of every y-axis label (OCR reads it as a random digit).
+    The sign is the first glyph of each label, followed by a space wider than the gaps between digits."""
+    g = crop.convert("L")
+    px = g.load()
+    w, h = g.size
+    dark = lambda x, y: px[x, y] < 160
+    rows = [any(dark(x, y) for x in range(w)) for y in range(h)]
+    y = 0
+    while y < h:
+        if not rows[y]:
+            y += 1
+            continue
+        y0 = y
+        while y < h and rows[y]:
+            y += 1
+        y1 = y                                   # one text line: rows y0..y1
+        cols = [any(dark(x, yy) for yy in range(y0, y1)) for x in range(w)]
+        x = next((i for i, c in enumerate(cols) if c), None)
+        if x is None:
+            continue
+        gap, cut = 0, None
+        for i in range(x, w):
+            if cols[i]:
+                if gap >= 3:
+                    cut = i
+                    break
+                gap = 0
+            else:
+                gap += 1
+        if cut:
+            for xx in range(0, cut):
+                for yy in range(y0, y1):
+                    px[xx, yy] = 255
+    return g
+
+
 def _axis_labels(img, plot_left):
-    """OCR the y-axis price labels -> list of (y_pixel, price)."""
-    crop = img.crop((0, 0, plot_left, img.height)).convert("L")
+    """OCR the y-axis price labels -> list of (y_pixel, [price])."""
+    crop = _erase_rupee(img.crop((0, 0, plot_left, img.height)))
     crop = crop.resize((crop.width * 4, crop.height * 4), Image.LANCZOS)
     with tempfile.NamedTemporaryFile(suffix=".png") as f:
         crop.save(f.name)
@@ -43,26 +80,31 @@ def _axis_labels(img, plot_left):
         if not txt.isdigit():
             continue
         y = (int(c[7]) + int(c[9]) / 2) / 4
-        out.append((y, int(txt) * mult))
+        out.append((y, [int(txt) * mult]))
     return out
 
 
 def _fit(labels):
-    """Linear map pixel-y -> price using labels that agree with each other (drop OCR mistakes)."""
+    """Linear map pixel-y -> price using labels that agree with each other (drop OCR mistakes).
+    labels: [(y, [candidate values])]."""
     best = None
     for i in range(len(labels)):
         for j in range(i + 1, len(labels)):
-            (y1, p1), (y2, p2) = labels[i], labels[j]
-            if abs(y2 - y1) < 5 or p1 == p2:
+            (y1, c1), (y2, c2) = labels[i], labels[j]
+            if abs(y2 - y1) < 5:
                 continue
-            a = (p2 - p1) / (y2 - y1)
-            if a >= 0:          # price must grow upwards
-                continue
-            b = p1 - a * y1
-            ok = sum(1 for y, p in labels if abs(a * y + b - p) <= max(1, 0.02 * abs(p)))
-            if not best or ok > best[0]:
-                best = (ok, a, b)
-    if not best or best[0] < 3:
+            for p1 in c1:
+                for p2 in c2:
+                    if p1 == p2:
+                        continue
+                    a = (p2 - p1) / (y2 - y1)
+                    if a >= 0:          # price must grow upwards
+                        continue
+                    b = p1 - a * y1
+                    ok = sum(1 for y, cs in labels if any(abs(a * y + b - p) <= max(1, 0.02 * abs(p)) for p in cs))
+                    if not best or ok > best[0] or (ok == best[0] and abs(a) < abs(best[1])):
+                        best = (ok, a, b)
+    if not best or best[0] < max(3, int(0.7 * len(labels))):
         return None
     return best[1], best[2]
 
