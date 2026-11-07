@@ -291,32 +291,99 @@ def dealsmagnet_store_link(page_url):
     return ""
 
 
-def resolve(link):
-    """Follow a short/affiliate link to the real store page. Returns (clean_url, store, asin)."""
-    if not link:
-        return "", "", ""
-    try:
-        req = urllib.request.Request(link, headers={"User-Agent": "Mozilla/5.0"})
-        final = urllib.request.urlopen(req, timeout=8).geturl()
-    except urllib.error.HTTPError as e:
-        final = e.url or link
-    except Exception:
-        final = link
-    if "dealsmagnet.com/deal/" in final:
-        final = dealsmagnet_store_link(final) or final
-    asin = re.search(r"amazon\.in/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10})", final)
+STORE_URL = re.compile(r"https?://(?:www\.|dl\.|m\.)?(?:amazon\.in|flipkart\.com|myntra\.com|ajio\.com)/\S*", re.I)
+
+
+def _hops(link, max_hops=7):
+    """Follow redirects one by one; return every URL seen (affiliate trackers hide the store URL in a dl= param)."""
+    seen, url = [link], link
+    opener = urllib.request.build_opener(_NoRedirect)
+    for _ in range(max_hops):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14) Chrome/130 Mobile"})
+            r = opener.open(req, timeout=8)
+            body = r.read(200000).decode("utf-8", "replace")
+            m = re.search(r"(?:location(?:\.href)?\s*=\s*|url=)[\"']?(https?://[^\"' ;>]+)", body, re.I)
+            if m and m.group(1) not in seen:
+                url = html.unescape(m.group(1))
+                seen.append(url)
+                continue
+            break
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location")
+            if e.code in (301, 302, 303, 307, 308) and loc:
+                url = urllib.parse.urljoin(url, loc)
+                seen.append(url)
+                continue
+            break
+        except Exception:
+            break
+    out = []
+    for u in seen:
+        out.append(u)
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+        for key in ("dl", "url", "u", "redirect", "target", "ulp"):
+            for v in q.get(key, []):
+                if v.startswith("http"):
+                    out.append(v)
+    return out
+
+
+def _clean(url):
+    asin = re.search(r"amazon\.in/(?:.*?/)?(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})", url)
     if asin:
         return f"https://www.amazon.in/dp/{asin.group(1)}", "Amazon", asin.group(1)
-    fk = re.search(r"(https://www\.flipkart\.com/[^?]+)(?:\?.*?(pid=[A-Z0-9]+))?", final)
-    if fk:
-        return fk.group(1) + ("?" + fk.group(2) if fk.group(2) else ""), "Flipkart", ""
-    my = re.search(r"https://www\.myntra\.com/[^?]+", final)
+    fk = re.search(r"https://(?:www\.|dl\.)?flipkart\.com(/[^?#]*)(?:\?[^#]*?\b(pid=[A-Z0-9]+))?", url)
+    if fk and ("/p/" in fk.group(1) or fk.group(2)):
+        path = fk.group(1) if "/p/itm" in fk.group(1) else "/product/p/itm"
+        return "https://www.flipkart.com" + path + ("?" + fk.group(2) if fk.group(2) else ""), "Flipkart", ""
+    my = re.search(r"https://www\.myntra\.com/[^?#]+", url)
     if my:
         return my.group(0), "Myntra", ""
-    host = urllib.parse.urlparse(final).netloc.lower()
-    if OTHER_STORE.search(host):
-        return final, "OTHER", ""
+    aj = re.search(r"https://www\.ajio\.com/[^?#]+", url)
+    if aj:
+        return aj.group(0), "OTHER", ""
+    if OTHER_STORE.search(urllib.parse.urlparse(url).netloc):
+        return url, "OTHER", ""
+    return None
+
+
+def resolve(link):
+    """Follow a short/affiliate link to the real store product page.
+    Returns (clean_url, store, asin). Clean store URLs open straight in the Amazon / Flipkart app."""
+    if not link:
+        return "", "", ""
+    for u in _hops(link):
+        if "dealsmagnet.com/deal/" in u:
+            u = dealsmagnet_store_link(u) or u
+        c = _clean(u)
+        if c:
+            return c
+    try:                                  # last try: let urllib follow everything
+        req = urllib.request.Request(link, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14) Chrome/130 Mobile"})
+        c = _clean(urllib.request.urlopen(req, timeout=10).geturl())
+        if c:
+            return c
+    except Exception:
+        pass
     return link, "", ""
+
+
+def best_link(text):
+    """Resolve the post's links (Buy Now first) and return the first real store link."""
+    links = [l.rstrip(").,") for l in re.findall(r"https?://\S+", text)]
+    buy = re.search(r"buy\s*now\W{0,6}(https?://\S+)", text, re.I)
+    if buy:
+        links.insert(0, buy.group(1).rstrip(").,"))
+    tried = []
+    for l in links[:4]:
+        if l in tried or "t.me/" in l or "whatsapp.com" in l:
+            continue
+        tried.append(l)
+        r = resolve(l)
+        if r[1]:
+            return r
+    return (links[0] if links else ""), "", ""
 
 
 def mute_word(text):
@@ -576,7 +643,7 @@ def check(state, settings, test=False):
                 continue
             if key and dp:
                 state["recent"][key] = {"p": dp, "t": time.time()}
-            link, rstore, asin = resolve(first_link(text)) if not test else (first_link(text), "", "")
+            link, rstore, asin = best_link(text) if not test else (first_link(text), "", "")
             if rstore == "OTHER":            # link really goes to Zepto/Ajio/etc.
                 continue
             store = rstore or store_of(text)
