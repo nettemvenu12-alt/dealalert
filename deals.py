@@ -22,7 +22,7 @@ STATE = os.path.join(HERE, "state.json")          # runtime state (Actions cache
 SETTINGS = os.path.join(HERE, "settings.json")    # user settings (committed to the repo)
 CHANNELS = ["desidime", "dealsmagnet", "dealsheaven", "idoffers", "coolztricks", "coolzdeals",
             "GrabOnIndiaOfficial", "OfferLootApp", "ExtraPe", "pricehistoryapp", "desidime_deals"]
-DEFAULTS = {"level": "normal", "watch": [], "mute": [], "track": [], "banks": ["HDFC", "ICICI", "Axis", "SBI", "IDFC", "Kotak"], "min_off": 90, "elec_off": 70, "paused": False}
+DEFAULTS = {"level": "normal", "min_drop": 30, "watch": [], "mute": [], "track": [], "banks": ["HDFC", "ICICI", "Axis", "SBI", "IDFC", "Kotak"], "min_off": 90, "elec_off": 70, "paused": False}
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 SUMMARY_HOUR = 21
 
@@ -440,6 +440,7 @@ HELP = ("Deal Alert commands:\n"
         "/add airpods 9000 – watch, only if price ≤ ₹9000\n"
         "/remove iphone 15 – stop watching\n"
         "/list – your watchlist and settings\n"
+        "/drop 30 – usual price kante 30%+ takkuva unna anni deals\n"
         "/level best | normal | more – entha manchi deals kavali (Deal score 70+ / 55+ / 45+)\n"
         "/mute saree – hide deals with a word (or tap 🔕 under a deal)\n"
         "/unmute saree – show them again\n"
@@ -514,6 +515,10 @@ def handle_commands(state, settings):
                 changed = True
             else:
                 send("Ila: /target 2 15000")
+        elif cmd == "/drop" and arg.rstrip("%").isdigit():
+            settings["min_drop"] = max(10, min(90, int(arg.rstrip("%"))))
+            send(f"OK: usual price kante {settings['min_drop']}%+ takkuva unna anni deals vastayi (plus best score deals).")
+            changed = True
         elif cmd == "/level" and arg.lower() in LEVELS:
             settings["level"] = arg.lower()
             send({"best": "🏆 BEST only – score 70+ (takkuva alerts, top deals matrame)",
@@ -747,7 +752,9 @@ def check(state, settings, test=False):
             sc, label = score_deal(text, price, hist, cat, fline)
             if watch:
                 label = f"⭐ WATCHLIST: {watch}  ·  {label}"
-            if sc < need and not watch:
+            drop_ok = (hist and hist["drop"] >= settings.get("min_drop", 30) and hist["median"] - price >= 150) or \
+                      (not hist and discount(text) >= settings.get("min_drop", 30) + 20 and not label.startswith("❌"))
+            if sc < need and not watch and not drop_ok:
                 if hist:
                     stat(state, "fake")
                 print(f"skip score {sc:.0f}: {title_of(text)[:50]}")
