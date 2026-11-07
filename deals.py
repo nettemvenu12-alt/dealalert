@@ -22,7 +22,7 @@ STATE = os.path.join(HERE, "state.json")          # runtime state (Actions cache
 SETTINGS = os.path.join(HERE, "settings.json")    # user settings (committed to the repo)
 CHANNELS = ["desidime", "dealsmagnet", "dealsheaven", "idoffers", "coolztricks", "coolzdeals",
             "GrabOnIndiaOfficial", "OfferLootApp", "ExtraPe", "pricehistoryapp", "desidime_deals"]
-DEFAULTS = {"watch": [], "mute": [], "track": [], "banks": ["HDFC", "ICICI", "Axis", "SBI", "IDFC", "Kotak"], "min_off": 90, "elec_off": 70, "paused": False}
+DEFAULTS = {"level": "normal", "watch": [], "mute": [], "track": [], "banks": ["HDFC", "ICICI", "Axis", "SBI", "IDFC", "Kotak"], "min_off": 90, "elec_off": 70, "paused": False}
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 SUMMARY_HOUR = 21
 
@@ -440,8 +440,7 @@ HELP = ("Deal Alert commands:\n"
         "/add airpods 9000 – watch, only if price ≤ ₹9000\n"
         "/remove iphone 15 – stop watching\n"
         "/list – your watchlist and settings\n"
-        "/min 85 – send any deal with at least 85% off (now {min_off}%)\n"
-        "/elec 60 – electronics with at least 60% off (now {elec_off}%)\n"
+        "/level best | normal | more – entha manchi deals kavali (Deal score 70+ / 55+ / 45+)\n"
         "/mute saree – hide deals with a word (or tap 🔕 under a deal)\n"
         "/unmute saree – show them again\n"
         "/pause, /resume – stop or restart alerts\n"
@@ -515,6 +514,12 @@ def handle_commands(state, settings):
                 changed = True
             else:
                 send("Ila: /target 2 15000")
+        elif cmd == "/level" and arg.lower() in LEVELS:
+            settings["level"] = arg.lower()
+            send({"best": "🏆 BEST only – score 70+ (takkuva alerts, top deals matrame)",
+                  "normal": "👍 NORMAL – score 55+ (manchi deals anni)",
+                  "more": "📬 MORE – score 45+ (ekkuva alerts)"}[arg.lower()])
+            changed = True
         elif cmd == "/banks" and arg:
             settings["banks"] = [b.strip() for b in re.split(r"[ ,]+", arg) if b.strip()]
             send("💳 Mee cards: " + ", ".join(settings["banks"]))
@@ -543,7 +548,7 @@ def handle_commands(state, settings):
         elif cmd == "/list":
             wl = "\n".join(f"• {w['word']}" + (f" (≤ ₹{w['max']})" if w.get("max") else "")
                            for w in settings["watch"]) or "• (empty) – /add iphone"
-            send(f"Watchlist:\n{wl}\n\nAny deal ≥ {settings['min_off']}% off\nElectronics ≥ {settings['elec_off']}% off\n"
+            send(f"Watchlist:\n{wl}\n\nLevel: {settings.get('level', 'normal')} (Deal score {LEVELS.get(settings.get('level', 'normal'), 55)}+)\n"
                  f"Muted: {', '.join(settings['mute']) or '-'}\nPrice mistakes: always\nAlerts: {'PAUSED' if settings['paused'] else 'ON'}")
         elif cmd in ("/min", "/elec") and arg.rstrip("%").isdigit():
             key = "min_off" if cmd == "/min" else "elec_off"
@@ -577,7 +582,7 @@ def remember(state, d, why, text, link=""):
     day = state.setdefault("today", {"date": today, "deals": []})
     if day["date"] != today:
         state["today"] = day = {"date": today, "deals": []}
-    score = d + (100 if "MISTAKE" in why else 0)
+    score = d
     day["deals"].append({"s": score, "d": round(d), "why": why, "t": title_of(text),
                          "p": int(min(prices(text))) if prices(text) else None,
                          "store": store_of(text), "link": link or first_link(text)})
@@ -593,7 +598,7 @@ def send_summary(state, now=False):
         return
     lines = []
     for i, x in enumerate(deals[:10], 1):
-        tag = "🚨" if "MISTAKE" in x["why"] else ("⭐" if "WATCH" in x["why"] else f"{x['d']}%")
+        tag = "🚨" if "MISTAKE" in x["why"] else ("⭐" if "WATCH" in x["why"] else f"[{x['d']}/100]")
         price = f" ₹{x['p']}" if x["p"] else ""
         lines.append(f"{i}. {tag}{price} {x['t']}{' · ' + x['store'] if x['store'] else ''}\n{x['link']}")
     st = state.get("stats", {})
@@ -605,8 +610,77 @@ def send_summary(state, now=False):
 
 # ---------- main loop ----------
 
+GOLD = re.compile(r"\bgold\b|\bsilver\b|24\s*k|22\s*k|\b999\b|mmtc|augmont|tanishq|kalyan|malabar|caratlane|"
+                  r"joyalukkas|senco|bullion|\bcoin\b", re.I)
+HOME = re.compile(r"mixer|grinder|juicer|cooker|kettle|\biron\b|\bfan\b|cooler|vacuum|chimney|induction|"
+                  r"purifier|geyser|heater|bedsheet|mattress|pillow|curtain|cookware|kadai|tawa|pan\b|"
+                  r"dinner set|bottle|flask|storage|container|bulb|led\b|inverter|battery|tools?\b|drill|"
+                  r"sofa|chair|table|bed\b|wardrobe|shoe rack|detergent|cleaner|towel|bucket|appliance", re.I)
+FASHION = re.compile(r"shoe|sneaker|t-?shirt|shirt|jeans|kurta|saree|dress|watch\b|bag\b|wallet|sunglass|"
+                     r"jacket|trouser|sandal|slipper|perfume", re.I)
+LEVELS = {"best": 70, "normal": 55, "more": 45}
+
+
+def category(text):
+    if GOLD.search(text) and re.search(r"gold|silver|coin|jewel", text, re.I):
+        return "🪙 Gold/Silver"
+    if ELECTRONICS.search(text):
+        return "📱 Electronics"
+    if FASHION.search(text):
+        return "👟 Fashion"
+    if HOME.search(text):
+        return "🏠 Home"
+    return "🛍 Other"
+
+
+def score_deal(text, price, hist, cat, final_line):
+    """0-100 'how good is this deal'. Uses real price history when we have it, else the post's own claims."""
+    bank = bool(final_line)
+    if hist:
+        drop, med, low = hist["drop"], hist["median"], hist["low"]
+        saving = med - (price or med)
+        if drop >= 60 and saving >= 150:
+            return 100, "🚨 REAL PRICE MISTAKE"
+        sc = drop * 1.4
+        at_low = price and price <= low * 1.03
+        if at_low and drop >= 5:
+            sc += 15
+        sc += min(15, max(saving, 0) / 400)
+        if cat == "📱 Electronics" or cat == "🏠 Home":
+            sc += 8
+        if cat == "🪙 Gold/Silver":                 # gold rarely drops much: any real drop or bank offer is good
+            sc += 25 + (15 if bank else 0)
+        if saving < 150 and cat != "🪙 Gold/Silver":
+            sc = min(sc - 30, 50)                   # cheap stuff, tiny saving: never a top deal
+        if drop < 3 and not (cat == "🪙 Gold/Silver" and bank):
+            return min(sc, 20), "❌ Fake discount (usual price)"
+        label = ("✅ LOWEST PRICE in 90 days" if at_low else "✅ REAL PRICE DROP")
+        return max(0, min(99, sc)), label
+    # no history (Flipkart / Myntra / unknown): trust the post less
+    if MISTAKE.search(text):
+        return 95, "🚨 PRICE MISTAKE (verify)"
+    if SALE_BANNER.search(text) and not price:
+        return 0, ""
+    d = discount(text)
+    sc = d * 0.8
+    if LOOT.search(text):
+        sc += 10
+    if cat in ("📱 Electronics", "🏠 Home"):
+        sc += 10
+    if cat == "🪙 Gold/Silver":
+        sc += 30 + (20 if bank else 0)
+    if bank:
+        sc += 5
+    p = price or 0
+    mrp = re.search(r"mrp\s*[:\-]?\s*(?:₹|rs\.?)\s*([\d,]+)", text, re.I)
+    if p and mrp and money(mrp.group(1)) - p < 150 and cat != "🪙 Gold/Silver":
+        sc -= 30
+    return max(0, min(94, sc)), f"🔥 {d:.0f}% off (history ledu)" if d else "🔥 Deal (history ledu)"
+
+
 def check(state, settings, test=False):
     seen = state.setdefault("seen", [])
+    need = LEVELS.get(settings.get("level", "normal"), 55)
     for ch in CHANNELS:
         try:
             posts = fetch(ch)
@@ -625,12 +699,11 @@ def check(state, settings, test=False):
                 continue
             if not test:
                 stat(state, "posts")
-            why, urgent = classify(text, settings)
-            amazonish = re.search(r"amzn|amazon", text, re.I)
-            maybe = amazonish and not OTHER_STORE.search(text) and not muted(text, settings) and (
-                discount(text) >= 40 or LOOT.search(text) or (ELECTRONICS.search(text) and discount(text) >= 25))
-            if not why and not maybe:
+            if OTHER_STORE.search(text) or muted(text, settings):
                 continue
+            if SALE_BANNER.search(text) and not deal_price(text) and not MISTAKE.search(text):
+                continue                       # "sale starts at / up to 80% off" banners
+            watch = watch_hit(text, settings)
             fp = fingerprint(text)
             if fp in seen:
                 continue
@@ -644,60 +717,53 @@ def check(state, settings, test=False):
             if key and dp:
                 state["recent"][key] = {"p": dp, "t": time.time()}
             link, rstore, asin = best_link(text) if not test else (first_link(text), "", "")
-            if rstore == "OTHER":            # link really goes to Zepto/Ajio/etc.
+            if rstore == "OTHER":            # link really goes to Zepto/Ajio/Blinkit etc.
                 continue
             store = rstore or store_of(text)
             text = re.sub(r"\n{3,}", "\n\n", text)
             price = deal_price(text)
             hist, proof = None, ""
-            live = None
             if store in ("Amazon", "Flipkart") and link and not test:
+                live = None
                 try:
                     _, live, oos = tracker.read({"store": store, "url": link})
                     if oos:
-                        print("skip out of stock:", link)
                         stat(state, "expired")
                         continue
                 except Exception as e:
                     print("live check failed:", e)
-                if live and price and live > price * 1.15 and not MISTAKE.search(text):
+                if live and price and live > price * 1.15:
                     print("skip expired:", link, price, live)
                     stat(state, "expired")
                     continue
-                if live and not price:
+                if live and (not price or live < price):
                     price = live
                 if live:
                     proof += f"\n🟢 Live ippudu: ₹{live:,.0f} ({store} lo direct check chesanu)"
             if asin and price and not test:
                 hist = cached_history(state, asin, price)
-            if hist:
-                watch = why and why.startswith("⭐")
-                saving = hist["median"] - price
-                elec = bool(ELECTRONICS.search(text))
-                worth = elec or saving >= 250              # skip ₹50-savings on cheap stuff
-                real = worth and (hist["label"].startswith("🚨") or (hist["label"].startswith("✅") and (
-                    hist["drop"] >= 30 or saving >= 1500 or (elec and hist["drop"] >= 20))))
-                if not real and not watch:
-                    print("skip fake:", asin, price, hist["label"])
+            cat = category(text)
+            fline = final_price_line(text, price, settings.get("banks", []))
+            sc, label = score_deal(text, price, hist, cat, fline)
+            if watch:
+                label = f"⭐ WATCHLIST: {watch}  ·  {label}"
+            if sc < need and not watch:
+                if hist:
                     stat(state, "fake")
-                    continue
-                why = (why + "  ·  " + hist["label"]) if watch else hist["label"]
-                urgent = urgent and watch or hist["label"].startswith("🚨")
+                print(f"skip score {sc:.0f}: {title_of(text)[:50]}")
+                continue
+            urgent = sc >= 95 or bool(watch)
+            if hist:
                 proof += (f"\n📊 90 rojula history: low ₹{hist['low']:,.0f} · usual ₹{hist['median']:,.0f} · "
-                         f"high ₹{hist['high']:,.0f}\n💰 Ippudu ₹{price:,.0f}  ({hist['drop']:.0f}% usual kante takkuva)")
-            elif not why:
-                continue                       # Amazon candidate whose history we couldn't read
-            elif store == "Amazon" and asin:
-                why += "  ·  ⚠️ history check kaaledu"
-            elif store != "Amazon":
-                why += "  ·  ⚠️ history ledu (verify)"
-            proof += final_price_line(text, price, settings.get("banks", []))
-            msg = (f"{why}{'  · ' + store if store else ''}{proof}\n\n{text}\n\n"
+                          f"high ₹{hist['high']:,.0f}\n💰 Ippudu ₹{price:,.0f}  ({hist['drop']:.0f}% usual kante takkuva)")
+            proof += fline
+            stars = "🟩" * round(sc / 20) + "⬜" * (5 - round(sc / 20))
+            msg = (f"{label}  · {store or '?'}\n{cat}  ·  Deal score {sc:.0f}/100 {stars}{proof}\n\n{text}\n\n"
                    f"⏱ Fast ga open cheyyandi, ivi nimishallo ayipothayi.")
-            print(msg[:200].replace("\n", " | "), "\n")
+            print(msg[:220].replace("\n", " | "), "\n")
             if test:
                 continue
-            remember(state, discount(text), why, text, link)
+            remember(state, sc, label, text, link)
             stat(state, "sent")
             if hist:
                 stat(state, "verified")
@@ -707,7 +773,7 @@ def check(state, settings, test=False):
                 else:
                     send(msg, buttons_for(link, asin, text))
                 if urgent:
-                    alarm(f"{why} {store}".strip(), title_of(text), link)
+                    alarm(f"{label} {store}".strip()[:80], title_of(text), link)
                 time.sleep(1)
         if not test:
             state[ch] = max(newest, last or 0)
