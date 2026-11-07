@@ -14,7 +14,7 @@ Usage:
   deals.py --loop N   keep checking every 20 s for N minutes
   deals.py --test     print what would be sent from the current posts (sends nothing)
 """
-import history
+import history, tracker
 import datetime, html, json, os, re, sys, time, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,7 +22,7 @@ STATE = os.path.join(HERE, "state.json")          # runtime state (Actions cache
 SETTINGS = os.path.join(HERE, "settings.json")    # user settings (committed to the repo)
 CHANNELS = ["desidime", "dealsmagnet", "dealsheaven", "idoffers", "coolztricks", "coolzdeals",
             "GrabOnIndiaOfficial", "OfferLootApp", "ExtraPe", "pricehistoryapp", "desidime_deals"]
-DEFAULTS = {"watch": [], "mute": [], "min_off": 90, "elec_off": 70, "paused": False}
+DEFAULTS = {"watch": [], "mute": [], "track": [], "banks": ["HDFC", "ICICI", "Axis", "SBI", "IDFC", "Kotak"], "min_off": 90, "elec_off": 70, "paused": False}
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 SUMMARY_HOUR = 21
 
@@ -90,6 +90,46 @@ def deal_price(text):
         if not NOT_PRICE.search(ctx):
             good.append(money(m.group(1)))
     return min(good) if good else None
+
+
+BANK = r"hdfc|icici|axis|sbi|kotak|idfc|bob|au|onecard|amex|federal|hsbc|rbl|yes|indusind|canara|pnb|citi"
+BANK_FLAT = re.compile(r"(?:₹|rs\.?)?\s*([\d,]+(?:\.\d+)?k?)\s*(?:instant\s*)?(?:off|discount|cashback)\s*"
+                       r"(?:with|on|using|via|for)?\s*((?:" + BANK + r")(?:\s*[/&,]\s*(?:" + BANK + r"))*)\b", re.I)
+BANK_PCT = re.compile(r"(\d{1,2})\s*%\s*(?:instant\s*)?(?:off|discount|cashback)\s*(?:with|on|using|via)?\s*"
+                      r"((?:" + BANK + r")(?:\s*[/&,]\s*(?:" + BANK + r"))*)\b", re.I)
+COUPON = re.compile(r"(?:apply|use|clip)?\s*(?:₹|rs\.?)\s*([\d,]+)\s*(?:off\s*)?(?:cpn|coupon)|"
+                    r"(\d[\d,]*k?)\s*(?:₹|rs\.?)?\s*(?:off\s*)?(?:cpn|coupon)|(?:cpn|coupon)\s*(?:of)?\s*(?:₹|rs\.?)\s*([\d,]+)", re.I)
+
+
+def _amt(s):
+    s = s.replace(",", "").lower()
+    return float(s[:-1]) * 1000 if s.endswith("k") else float(s)
+
+
+def final_price_line(text, price, banks):
+    """'💳 ...' line with the price after coupon and the best bank offer the user has, or ''."""
+    if not price or re.search(r"\bincl", text, re.I):     # bank offer already included in the shown price
+        return ""
+    coupon = 0.0
+    for m in COUPON.finditer(text):
+        v = next(g for g in m.groups() if g)
+        if _amt(v) < price:
+            coupon = max(coupon, _amt(v))
+    mine = {b.lower() for b in banks}
+    best, best_bank = 0.0, ""
+    for m in BANK_FLAT.finditer(text):
+        have = [b.upper() if len(b) <= 4 else b.title() for b in re.split(r"\s*[/&,]\s*", m.group(2)) if b.lower() in mine]
+        if have and _amt(m.group(1)) < price and _amt(m.group(1)) > best:
+            best, best_bank = _amt(m.group(1)), "/".join(have)
+    for m in BANK_PCT.finditer(text):
+        v = (price - coupon) * int(m.group(1)) / 100
+        for b in re.split(r"\s*[/&,]\s*", m.group(2)):
+            if b.lower() in mine and v > best:
+                best, best_bank = v, b.upper() if len(b) <= 4 else b.title()
+    if not coupon and not best:
+        return ""
+    parts = (["coupon"] if coupon else []) + ([f"{best_bank} card"] if best else [])
+    return f"\n💳 {' + '.join(parts)} tho final ≈ ₹{max(price - coupon - best, 0):,.0f}"
 
 
 def store_of(text):
@@ -338,7 +378,11 @@ HELP = ("Deal Alert commands:\n"
         "/mute saree – hide deals with a word (or tap 🔕 under a deal)\n"
         "/unmute saree – show them again\n"
         "/pause, /resume – stop or restart alerts\n"
-        "/top – today's top 10 deals now")
+        "/top – today's top 10 deals now\n\n"
+        "📦 Mee products direct ga track: Amazon/Flipkart product link ikkada paste cheyyandi "
+        "(link tarvata price raste target, e.g. 'link 15000')\n"
+        "/track – tracked list · /untrack 2 · /target 2 15000\n"
+        "/banks HDFC SBI – mee cards (final price lekka kosam)")
 
 
 def handle_commands(state, settings):
@@ -379,7 +423,36 @@ def handle_commands(state, settings):
         text = (msg.get("text") or "").strip()
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.lower().split("@")[0], arg.strip()
-        if cmd == "/add" and arg:
+        link = re.search(r"https?://\S+", text)
+        if link and not cmd.startswith("/"):
+            tm = re.search(r"(?:₹|rs\.?)?\s*(\d{3,7})\s*$", text[link.end():], re.I)
+            send(tracker.add(settings, link.group(0), float(tm.group(1)) if tm else None))
+            changed = True
+            continue
+        if cmd == "/track":
+            send(tracker.listing(settings))
+        elif cmd == "/untrack" and arg.isdigit():
+            tr = settings.get("track", [])
+            if 1 <= int(arg) <= len(tr):
+                it = tr.pop(int(arg) - 1)
+                send(f"Removed: {it['title'] or it['id']}")
+                changed = True
+            else:
+                send("Number tappu. /track chudandi.")
+        elif cmd == "/target":
+            m = re.match(r"(\d+)\s+(?:₹|rs\.?)?\s*([\d,]+)", arg, re.I)
+            tr = settings.get("track", [])
+            if m and 1 <= int(m.group(1)) <= len(tr):
+                tr[int(m.group(1)) - 1]["target"] = money(m.group(2))
+                send(f"🎯 Target set: ₹{money(m.group(2)):,.0f}")
+                changed = True
+            else:
+                send("Ila: /target 2 15000")
+        elif cmd == "/banks" and arg:
+            settings["banks"] = [b.strip() for b in re.split(r"[ ,]+", arg) if b.strip()]
+            send("💳 Mee cards: " + ", ".join(settings["banks"]))
+            changed = True
+        elif cmd == "/add" and arg:
             m = re.match(r"(.*?)\s+(?:₹|rs\.?)?\s*(\d{3,7})$", arg, re.I)
             word, mx = (m.group(1), int(m.group(2))) if m else (arg, None)
             settings["watch"] = [w for w in settings["watch"] if w["word"].lower() != word.lower()]
@@ -458,7 +531,8 @@ def send_summary(state, now=False):
         lines.append(f"{i}. {tag}{price} {x['t']}{' · ' + x['store'] if x['store'] else ''}\n{x['link']}")
     st = state.get("stats", {})
     footer = (f"\n\n📈 Ivala: {st.get('posts', 0)} posts scan chesanu · {st.get('sent', 0)} alerts pampanu "
-              f"({st.get('verified', 0)} history tho verify) · {st.get('fake', 0)} fake discounts skip chesanu.")
+              f"({st.get('verified', 0)} history tho verify) · {st.get('fake', 0)} fake discounts, "
+              f"{st.get('expired', 0)} expired deals skip chesanu.")
     send(f"🏆 Today's top {len(lines)} deals ({day['date']})\n\n" + "\n\n".join(lines) + footer)
 
 
@@ -509,6 +583,24 @@ def check(state, settings, test=False):
             text = re.sub(r"\n{3,}", "\n\n", text)
             price = deal_price(text)
             hist, proof = None, ""
+            live = None
+            if store in ("Amazon", "Flipkart") and link and not test:
+                try:
+                    _, live, oos = tracker.read({"store": store, "url": link})
+                    if oos:
+                        print("skip out of stock:", link)
+                        stat(state, "expired")
+                        continue
+                except Exception as e:
+                    print("live check failed:", e)
+                if live and price and live > price * 1.15 and not MISTAKE.search(text):
+                    print("skip expired:", link, price, live)
+                    stat(state, "expired")
+                    continue
+                if live and not price:
+                    price = live
+                if live:
+                    proof += f"\n🟢 Live ippudu: ₹{live:,.0f} ({store} lo direct check chesanu)"
             if asin and price and not test:
                 hist = cached_history(state, asin, price)
             if hist:
@@ -524,7 +616,7 @@ def check(state, settings, test=False):
                     continue
                 why = (why + "  ·  " + hist["label"]) if watch else hist["label"]
                 urgent = urgent and watch or hist["label"].startswith("🚨")
-                proof = (f"\n📊 90 rojula history: low ₹{hist['low']:,.0f} · usual ₹{hist['median']:,.0f} · "
+                proof += (f"\n📊 90 rojula history: low ₹{hist['low']:,.0f} · usual ₹{hist['median']:,.0f} · "
                          f"high ₹{hist['high']:,.0f}\n💰 Ippudu ₹{price:,.0f}  ({hist['drop']:.0f}% usual kante takkuva)")
             elif not why:
                 continue                       # Amazon candidate whose history we couldn't read
@@ -532,6 +624,7 @@ def check(state, settings, test=False):
                 why += "  ·  ⚠️ history check kaaledu"
             elif store != "Amazon":
                 why += "  ·  ⚠️ history ledu (verify)"
+            proof += final_price_line(text, price, settings.get("banks", []))
             msg = (f"{why}{'  · ' + store if store else ''}{proof}\n\n{text}\n\n"
                    f"⏱ Fast ga open cheyyandi, ivi nimishallo ayipothayi.")
             print(msg[:200].replace("\n", " | "), "\n")
@@ -557,6 +650,19 @@ def check(state, settings, test=False):
         del rec[k]
 
 
+def track_alert(text, it, urgent, settings):
+    if settings.get("paused"):
+        return
+    btn = [[{"text": "🛒 Buy now", "url": it["url"]}]]
+    if it["store"] == "Amazon":
+        btn[0].append({"text": "📈 Price history", "url": f"https://keepa.com/#!product/10-{it['id']}"})
+        send_photo(history.graph_url(it["id"]), text, btn)
+    else:
+        send(text + "\n" + it["url"], btn)
+    if urgent:
+        alarm(text.splitlines()[0], text.splitlines()[1] if "\n" in text else text, it["url"])
+
+
 def main():
     state = load(STATE, {})
     settings = load(SETTINGS, DEFAULTS)
@@ -573,6 +679,8 @@ def main():
         if handle_commands(state, settings):
             save(SETTINGS, settings)
         check(state, settings)
+        if settings.get("track") and tracker.check(settings, lambda t, it, urgent: track_alert(t, it, urgent, settings)):
+            save(SETTINGS, settings)
         now = datetime.datetime.now(IST)
         today = now.strftime("%Y-%m-%d")
         if now.hour >= SUMMARY_HOUR and state.get("summary_sent") != today:
